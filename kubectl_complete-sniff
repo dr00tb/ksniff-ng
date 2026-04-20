@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+args=("$@")
+nargs=${#args[@]}
+
+# Current word (last arg, possibly empty).
+if (( nargs > 0 )); then
+    cur="${args[$((nargs-1))]}"
+else
+    cur=""
+fi
+
+# Previous word — the flag immediately before $cur, if any.
+if (( nargs >= 2 )); then
+    prev="${args[$((nargs-2))]}"
+else
+    prev=""
+fi
+
+# Scan all prior args (everything except the current word) for -n/--namespace.
+namespace=""
+for ((i=0; i < nargs-1; i++)); do
+    case "${args[i]}" in
+        -n|--namespace)      namespace="${args[i+1]}" ;;
+        --namespace=*)       namespace="${args[i]#--namespace=}" ;;
+        -n=*)                namespace="${args[i]#-n=}" ;;
+    esac
+done
+
+ns_arg=()
+[[ -n "$namespace" ]] && ns_arg=(-n "$namespace")
+
+case "$prev" in
+    -n|--namespace)
+        compgen -W "$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" -- "$cur"
+        exit 0
+        ;;
+    -i|--interface)
+        # Find the pod already on the command line and list its interfaces.
+        # /sys/class/net is one entry per interface — no parsing needed, and
+        # doesn't require the `ip` tool in the image.
+        pod=""
+        value_flags_re='^(-n|--namespace|-i|--interface|-f|--filter|-o|--output|-I|--image)$'
+        for ((i=0; i < nargs-1; i++)); do
+            if [[ "${args[i]}" =~ $value_flags_re ]]; then
+                i=$((i+1)); continue
+            fi
+            [[ "${args[i]}" == -* ]] && continue
+            pod="${args[i]}"
+            break
+        done
+        if [[ -n "$pod" ]]; then
+            ifaces=$(kubectl "${ns_arg[@]}" exec "$pod" -- ls /sys/class/net 2>/dev/null)
+            compgen -W "any $ifaces" -- "$cur"
+        else
+            compgen -W "any lo eth0" -- "$cur"
+        fi
+        exit 0
+        ;;
+    -o|--output|-f|--filter|-I|--image)
+        # Filenames, filters, image refs: nothing sensible to enumerate.
+        exit 0
+        ;;
+esac
+
+# Completing a flag itself.
+if [[ "$cur" == -* ]]; then
+    compgen -W "-n --namespace -i --interface -f --filter -o --output -I --image -h --help" -- "$cur"
+    exit 0
+fi
+
+# Default: positional POD argument — list pods in the resolved namespace.
+compgen -W "$(kubectl "${ns_arg[@]}" get pods -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" -- "$cur"

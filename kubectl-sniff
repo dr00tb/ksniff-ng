@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+IMAGE="alpine:latest"
+INTERFACE="any"
+FILTER=""
+NAMESPACE=""
+OUTPUT=""
+
+usage() {
+  cat >&2 <<EOF
+Usage: ${0##*/} [options] POD
+
+Options:
+  -n, --namespace NS     Pod namespace (default: current kube context)
+  -i, --interface IFACE  Capture interface inside the pod (default: any)
+  -f, --filter EXPR      tcpdump filter expression, e.g. 'tcp port 80'
+  -o, --output DEST      Write pcap to DEST. Use '-' to write to stdout so
+                         you can pipe into anything (e.g. tshark -r -).
+                         Default: open Wireshark.
+  -I, --image IMAGE      Ephemeral container image (default: alpine:latest).
+                         Useful for air-gapped clusters that mirror images
+                         to an internal registry.
+  -h, --help             Show this help
+
+Examples:
+  ${0##*/} my-pod
+  ${0##*/} -n prod -f 'port 443' my-pod
+  ${0##*/} -o /tmp/trace.pcap my-pod
+  ${0##*/} -f 'port 80' -o - my-pod | tshark -r -
+  ${0##*/} -I registry.internal/mirror/alpine:3.20 my-pod
+EOF
+}
+
+POD=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+    -i|--interface) INTERFACE="$2"; shift 2 ;;
+    -f|--filter)    FILTER="$2";    shift 2 ;;
+    -o|--output)    OUTPUT="$2";    shift 2 ;;
+    -I|--image)     IMAGE="$2";     shift 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; POD="${1:-}"; break ;;
+    -*)             echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *)              POD="$1"; shift ;;
+  esac
+done
+
+[[ -z "$POD" ]] && { usage; exit 2; }
+
+command -v kubectl >/dev/null 2>&1 || {
+  echo "kubectl not found in PATH" >&2; exit 1;
+}
+if [[ -z "$OUTPUT" ]]; then
+  command -v wireshark >/dev/null 2>&1 || {
+    echo "wireshark not found in PATH. Use -o FILE, or -o - to pipe elsewhere." >&2
+    exit 1
+  }
+fi
+
+SNIFFER="ksniff-$(date +%s)-$$"
+
+CTX=()
+[[ -n "$NAMESPACE" ]] && CTX+=(--namespace="$NAMESPACE")
+
+# Persistent fd for kubectl --custom; process substitution in an array would be closed too early.
+exec {PROFILE_FD}< <(printf '{"securityContext":{"runAsUser":0,"runAsNonRoot":false}}')
+
+# SIGTERM the sniffer's PID 1 (our sh wrapper); its trap runs `exit 0` and the container terminates.
+cleanup() {
+  kubectl "${CTX[@]}" exec "$POD" -c "$SNIFFER" -- \
+    sh -c 'kill 1 2>/dev/null || true' >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+echo ">> Injecting '$SNIFFER' into '$POD'..." >&2
+
+# Entrypoint is sh-with-trap (not bare `sleep`) so PID 1 can receive SIGTERM from cleanup.
+INJECT=(debug "${CTX[@]}" --attach=false
+        --container="$SNIFFER"
+        --image="$IMAGE" --image-pull-policy=IfNotPresent
+        --profile=netadmin
+        --custom="/dev/fd/$PROFILE_FD"
+        "$POD" -- sh -c 'trap "exit 0" TERM INT; sleep infinity & wait')
+
+kubectl "${INJECT[@]}" >&2
+
+echo ">> Waiting for sniffer to start..." >&2
+state=""
+for _ in $(seq 1 60); do
+  state=$(kubectl "${CTX[@]}" get pod "$POD" \
+    -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='$SNIFFER')].state}" \
+    2>/dev/null || true)
+  [[ "$state" == *running* ]] && break
+  sleep 1
+done
+[[ "$state" == *running* ]] || {
+  echo "Sniffer container did not reach Running state." >&2
+  exit 1
+}
+
+echo ">> Installing tcpdump and starting capture (interface=$INTERFACE, filter='${FILTER:-none}')..." >&2
+echo ">> Ctrl+C to stop." >&2
+
+# `1>&2` keeps apk output off stdout; `exec` replaces the shell so only tcpdump's pcap bytes can reach the pipe.
+REMOTE="apk add --no-cache tcpdump 1>&2 && exec tcpdump -i ${INTERFACE} -U -w - ${FILTER}"
+CAPTURE=(kubectl "${CTX[@]}" exec -i "$POD" -c "$SNIFFER" -- sh -c "$REMOTE")
+
+rc=0
+if [[ -z "$OUTPUT" ]]; then
+  "${CAPTURE[@]}" | wireshark -k -i - || rc=$?
+elif [[ "$OUTPUT" == "-" ]]; then
+  "${CAPTURE[@]}" || rc=$?
+else
+  "${CAPTURE[@]}" > "$OUTPUT" || rc=$?
+fi
+
+# 130 = SIGINT (Ctrl+C), 141 = SIGPIPE (viewer closed) — both normal user-driven shutdowns.
+case $rc in 130|141) rc=0 ;; esac
+exit $rc
